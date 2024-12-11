@@ -1,4 +1,5 @@
 use std::io;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,13 +9,15 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 use crate::frame::{Frame, FrameType, FLAG_ACK};
-use crate::stream::{Stream, StreamPool, StreamReceiver, StreamSender};
+use crate::stream::pool::StreamPool;
+use crate::stream::{Stream, StreamId, StreamReceiver, StreamSender};
 
 const DEFAULT_BUFFER_SIZE: usize = 8192;
 const PING_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct Connection {
     pool: Arc<StreamPool>,
+    next_stream_id: AtomicU32,
     accept_streams: StreamReceiver,
 }
 
@@ -26,23 +29,23 @@ impl Connection {
         let (frame_sender, mut frame_receiver) = mpsc::channel(DEFAULT_BUFFER_SIZE);
         let (accept_streams_sender, accept_streams) = mpsc::channel(DEFAULT_BUFFER_SIZE);
 
-        let pool = Arc::new(StreamPool::new(1, frame_sender));
+        let pool = Arc::new(StreamPool::new(frame_sender));
+        // TODO: insert connection control stream
+
         let result = Connection {
             pool: pool.clone(),
             accept_streams,
+            next_stream_id: AtomicU32::new(1),
         };
 
         let (mut read_half, mut write_half) = tokio::io::split(transport);
 
         // 处理出站帧
         tokio::spawn({
-            let pool = pool.clone();
             async move {
-                while let Some(frame) = frame_receiver.recv().await {
-                    if let Err(e) = write_frame(&mut write_half, frame).await {
-                        eprintln!("Failed to write frame: {}", e);
-                        break;
-                    }
+                while let Some(data) = frame_receiver.recv().await {
+                    write_half.write_all(&data).await.unwrap();
+                    write_half.flush().await.unwrap();
                 }
                 // 连接关闭时清理资源
                 if let Err(e) = write_half.shutdown().await {
@@ -80,11 +83,19 @@ impl Connection {
 
     pub async fn open_stream(&self) -> io::Result<Stream> {
         let stream_id = self
-            .pool
             .next_stream_id()
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "stream id exhausted"))?;
 
         self.pool.create_stream(stream_id).await
+    }
+
+    pub(crate) fn next_stream_id(&self) -> Option<StreamId> {
+        let id = self.next_stream_id.fetch_add(2, Ordering::Relaxed);
+        // 检查是否溢出
+        if id > 0x7fffffff {
+            return None;
+        }
+        Some(id)
     }
 
     // 接受一个新的入站流
@@ -104,13 +115,6 @@ impl Connection {
     pub async fn ping(&self) -> io::Result<Duration> {
         todo!("Implement ping functionality")
     }
-}
-
-// 写入帧到传输层
-async fn write_frame<T: AsyncWrite + Unpin>(write_half: &mut T, frame: Frame) -> io::Result<()> {
-    let encoded = frame.encode();
-    write_half.write_all(&encoded).await?;
-    write_half.flush().await
 }
 
 // 从传输层读取帧
@@ -152,7 +156,7 @@ async fn handle_frame(
     // 处理流级别的帧
     match frame.frame_type {
         FrameType::Data | FrameType::WindowUpdate => {
-            match pool.get_control(frame.stream_id) {
+            match pool.get(frame.stream_id) {
                 Some(_) => {
                     // 已存在的流
                     pool.handle_frame(frame).await?;
@@ -173,7 +177,7 @@ async fn handle_frame(
             }
         }
         FrameType::RstStream => {
-            if let Some(control) = pool.get_control(frame.stream_id) {
+            if let Some(control) = pool.get(frame.stream_id) {
                 // 处理流重置
                 pool.handle_frame(frame).await?;
             }
@@ -195,9 +199,9 @@ async fn handle_connection_frame(pool: &StreamPool, frame: Frame) -> io::Result<
         FrameType::Ping => {
             if !frame.is_ack() {
                 // 收到 PING，回复 PONG
-                let pong = Frame::pong(frame.payload[..8].try_into().unwrap());
-                if let Some(control) = pool.get_control(0) {
-                    control.sender.send(pong).await.map_err(|_| {
+                let pong = Frame::ping_ack(frame.payload[..8].try_into().unwrap());
+                if let Some(control) = pool.get(0) {
+                    control.outbound.send(pong.encode()).await.map_err(|_| {
                         io::Error::new(io::ErrorKind::BrokenPipe, "failed to send pong")
                     })?;
                 }

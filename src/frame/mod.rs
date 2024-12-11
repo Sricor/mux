@@ -1,15 +1,11 @@
 use std::io;
 
 use bytes::{Bytes, BytesMut};
-use tokio::sync::mpsc;
 
 use crate::stream::StreamId;
 
-pub(crate) type FrameSender = mpsc::Sender<Frame>;
-pub(crate) type FrameReceiver = mpsc::Receiver<Frame>;
-
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum FrameType {
+pub enum FrameType {
     Data,
     Ping,
     GoAway,
@@ -97,7 +93,7 @@ impl Frame {
         Self::new(FrameType::Ping, 0, 0, Bytes::copy_from_slice(&payload))
     }
 
-    pub(crate) fn pong(payload: [u8; 8]) -> Self {
+    pub(crate) fn ping_ack(payload: [u8; 8]) -> Self {
         Self::new(
             FrameType::Ping,
             FLAG_ACK,
@@ -223,11 +219,11 @@ mod tests {
     }
 
     #[test]
-    fn test_ping_pong() {
+    fn test_ping_ack() {
         let ping = Frame::ping([1; 8]);
         assert!(!ping.is_ack());
 
-        let pong = Frame::pong([1; 8]);
+        let pong = Frame::ping_ack([1; 8]);
         assert!(pong.is_ack());
     }
 
