@@ -5,4 +5,4 @@ edition = "2021"
 
 [dependencies]
 bytes = { version = "1" }
-tokio = { version = "1", features = ["net", "sync", "io-util"] }
+tokio = { version = "1", features = ["rt", "net", "sync", "io-util"] }

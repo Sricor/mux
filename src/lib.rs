@@ -1,3 +1,6 @@
-// mod connection;
+mod connection;
 mod frame;
-// mod stream;
+mod stream;
+
+pub use connection::Connection;
+pub use stream::Stream;

@@ -1,15 +1,20 @@
-use bytes::{Bytes, BytesMut};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::{collections::HashMap, io};
-use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use std::collections::HashMap;
+use std::io;
+use std::sync::Mutex;
 
-use crate::frame::{Frame, FrameType};
+use tokio::sync::mpsc;
+
+use crate::frame::{Frame, FrameReceiver, FrameSender};
+
+pub(crate) type StreamSender = mpsc::Sender<Stream>;
+pub(crate) type StreamReceiver = mpsc::Receiver<Stream>;
+
+pub(crate) type StreamId = u32;
+pub(crate) type StreamInbound = FrameSender;
 
 const DEFAULT_BUFFER_SIZE: usize = 8192;
 
-// 流的状态
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum StreamState {
     Open,
@@ -17,191 +22,156 @@ enum StreamState {
     Closed,
 }
 
-// 流的实现
 pub struct Stream {
     id: u32,
     state: StreamState,
-    buffer: Vec<u8>,
-    tx: mpsc::Sender<Bytes>,
-    rx: mpsc::Receiver<Bytes>,
-    window_size: usize,
+    writer: FrameSender,
+    reader: FrameReceiver,
 }
 
 impl Stream {
-    fn new(id: u32) -> (Self, mpsc::Sender<Bytes>) {
-        let (tx1, rx) = mpsc::channel(DEFAULT_BUFFER_SIZE);
-        let (tx2, _) = mpsc::channel(DEFAULT_BUFFER_SIZE);
-        
-        (Stream {
-            id,
-            state: StreamState::Open,
-            buffer: Vec::new(),
-            tx: tx1,
-            rx,
-            window_size: DEFAULT_BUFFER_SIZE,
-        }, tx2)
+    fn new(id: u32, writer: FrameSender) -> (Self, FrameSender) {
+        let (tx2, reader) = mpsc::channel(DEFAULT_BUFFER_SIZE);
+
+        (
+            Stream {
+                id,
+                state: StreamState::Open,
+                writer,
+                reader,
+            },
+            tx2,
+        )
     }
 
-    async fn send(&mut self, data: Bytes) -> Result<()> {
-        if self.state == StreamState::Closed {
-            return Err(anyhow::anyhow!("Stream is closed"));
-        }
-        self.tx.send(data).await?;
-        Ok(())
+    pub async fn close(&mut self) {
+        self.state = StreamState::Closed;
     }
 
-    async fn recv(&mut self) -> Option<Bytes> {
-        self.rx.recv().await
+    pub fn is_closed(&self) -> bool {
+        matches!(self.state, StreamState::Closed)
     }
 }
-pub struct Multiplexer<T> {
-    transport: T,
-    streams: Arc<Mutex<HashMap<u32, Stream>>>,
+
+pub(crate) struct StreamPool {
+    inner: Mutex<HashMap<StreamId, StreamInbound>>,
     next_stream_id: AtomicU32,
-    default_window_size: u32,
+    stream_outbound: FrameSender,
 }
 
-impl<T> Multiplexer<T>
-where
-    T: AsyncRead + AsyncWrite + Unpin,
-{
-    pub fn new(transport: T) -> Self {
-        Multiplexer {
-            transport,
-            streams: Arc::new(Mutex::new(HashMap::new())),
-            next_stream_id: AtomicU32::new(1),
-            default_window_size: 65535,
-        }
+impl StreamPool {
+    pub(crate) fn new(init_stream_id: StreamId, stream_outbound: FrameSender) -> Self {
+        Self { inner: Mutex::new(HashMap::new()), next_stream_id: AtomicU32::new(init_stream_id), stream_outbound }    
     }
 
-    pub async fn create_stream(&self) -> io::Result<(u32, mpsc::Sender<Bytes>)> {
-        let stream_id = self.next_stream_id.fetch_add(2, Ordering::Relaxed);
-        let (stream, tx) = Stream::new(stream_id, self.default_window_size);
-        
-        let mut streams = self.streams.lock().await;
-        streams.insert(stream_id, stream);
-        
-        Ok((stream_id, tx))
+    pub(crate) async fn open_stream(&self, stream_id: StreamId) -> io::Result<Stream> {
+        let (stream, stream_inbound) = Stream::new(stream_id, self.stream_outbound.clone());
+
+        self.insert((stream.id, stream_inbound)).await;
+
+        Ok(stream)
     }
 
-    async fn send_frame(&mut self, frame: Frame) -> io::Result<()> {
-        let encoded = frame.encode();
-        self.transport.write_all(&encoded).await?;
-
-        Ok(())
+    // TODO: 溢出时无法开启新的流，返回 None
+    /// when to max, return none
+    pub(crate) fn next_stream_id(&self) -> Option<StreamId> {
+        Some(self.next_stream_id.fetch_add(2, Ordering::Relaxed))
     }
 
-    async fn read_frame(&mut self) -> io::Result<Option<Frame>> {
-        let mut buf = BytesMut::with_capacity(Frame::HEADER_LENGTH);
+    async fn insert(&self, object: (StreamId, StreamInbound)) -> Option<StreamInbound> {
+        let mut pool = self.inner.lock().unwrap();
 
-        loop {
-            match self.transport.read_buf(&mut buf).await? {
-                0 if buf.is_empty() => return Ok(None),
-                0 => return Err(io::Error::other("Connection closed unexpectedly")),
-                _ => {
-                    if let Some(frame) = Frame::decode(&mut buf)? {
-                        return Ok(Some(frame));
+        pool.insert(object.0, object.1)
+    }
+
+    pub(crate) async fn get(&self, stream_id: StreamId) -> Option<StreamInbound> {
+        let pool = self.inner.lock().unwrap();
+
+        pool.get(&stream_id).cloned()
+    }
+}
+
+mod impl_tokio_io_async {
+    use std::io;
+    use std::pin::Pin;
+    use std::task::Context;
+    use std::task::Poll;
+
+    use bytes::Bytes;
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    use super::{Frame, Stream, StreamState};
+
+    impl AsyncRead for Stream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let stream = self.get_mut();
+
+            match stream.reader.poll_recv(cx) {
+                Poll::Ready(Some(frame)) => {
+                    let payload = frame.payload;
+
+                    if buf.remaining() >= payload.len() {
+                        buf.put_slice(&payload);
+
+                        Poll::Ready(Ok(()))
+                    } else {
+                        Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            "not enough space in buffer",
+                        )))
                     }
                 }
+                Poll::Ready(None) => Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "channel closed",
+                ))),
+                Poll::Pending => Poll::Pending,
             }
         }
     }
 
-    pub async fn run(&mut self) -> io::Result<()> {
-        loop {
-            match self.read_frame().await? {
-                Some(frame) => self.handle_frame(frame).await?,
-                None => break,
+    impl AsyncWrite for Stream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            use tokio::sync::mpsc::error::TrySendError;
+
+            let stream = self.get_mut();
+
+            if stream.state == StreamState::Closed {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "stream is closed",
+                )));
             }
-        }
-        Ok(())
-    }
 
-    async fn handle_frame(&mut self, frame: Frame) -> io::Result<()> {
-        let mut streams = self.streams.lock().await;
-        
-        match frame.frame_type {
-            FrameType::Data => {
-                let stream = streams.get_mut(&frame.stream_id)
-                    .ok_or(Error::StreamNotFound(frame.stream_id))?;
-                
-                if stream.state == StreamState::Closed {
-                    return Err(Error::StreamClosed(frame.stream_id));
-                }
+            let frame = Frame::with_data_payload(stream.id, Bytes::copy_from_slice(buf));
 
-                if stream.window_size < frame.payload.len() as u32 {
-                    return Err(Error::Protocol("Flow control violation".into()));
-                }
-
-                stream.window_size -= frame.payload.len() as u32;
-                stream.sender.send(frame.payload)
-                    .await
-                    .map_err(|e| Error::SendError(e.to_string()))?;
-
-                if frame.flags.contains(Flags::END_STREAM) {
-                    stream.state = match stream.state {
-                        StreamState::Open => StreamState::HalfClosedRemote,
-                        StreamState::HalfClosedLocal => StreamState::Closed,
-                        _ => return Err(Error::Protocol("Invalid stream state transition".into())),
-                    };
-                }
-            }
-            FrameType::WindowUpdate => {
-                let stream = streams.get_mut(&frame.stream_id)
-                    .ok_or(Error::StreamNotFound(frame.stream_id))?;
-
-                if frame.payload.len() != 4 {
-                    return Err(Error::InvalidFrame("Invalid window update size".into()));
-                }
-
-                let increment = u32::from_be_bytes([
-                    frame.payload[0], frame.payload[1],
-                    frame.payload[2], frame.payload[3],
-                ]);
-
-                stream.window_size += increment;
-            }
-            FrameType::Ping => {
-                if frame.stream_id != 0 {
-                    return Err(Error::Protocol("PING must have stream ID 0".into()));
-                }
-
-                if !frame.flags.contains(Flags::ACK) {
-                    let response = Frame::new(
-                        0,
-                        FrameType::Ping,
-                        Flags::new(Flags::ACK),
-                        frame.payload,
-                    );
-                    self.send_frame(response).await?;
-                }
-            }
-            FrameType::GoAway => {
-                let stream_id = u32::from_be_bytes([
-                    frame.payload[0], frame.payload[1],
-                    frame.payload[2], frame.payload[3],
-                ]);
-
-                for (id, stream) in streams.iter_mut() {
-                    if *id <= stream_id {
-                        stream.state = StreamState::Closed;
-                    }
-                }
+            match stream.writer.try_send(frame) {
+                Ok(()) => Poll::Ready(Ok(buf.len())),
+                Err(TrySendError::Full(_)) => Poll::Pending,
+                Err(TrySendError::Closed(_)) => Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "connection is closed",
+                ))),
             }
         }
 
-        Ok(())
-    }
-
-    pub async fn close(&mut self, stream_id: u32) -> io::Result<()> {
-        let mut streams = self.streams.lock().await;
-
-        if let Some(stream) = streams.get_mut(&stream_id) {
-            stream.state = StreamState::Closed;
-            // todo: drop stream
-            streams.remove(&stream_id);
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
         }
-        
-        Ok(())
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
     }
 }

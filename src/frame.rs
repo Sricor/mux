@@ -1,12 +1,17 @@
 use std::io;
 
+use tokio::sync::mpsc;
 use bytes::{Bytes, BytesMut};
 
+use crate::stream::StreamId;
+
+pub(crate) type FrameSender = mpsc::Sender<Frame>;
+pub(crate) type FrameReceiver = mpsc::Receiver<Frame>;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum FrameType {
+pub(crate) enum FrameType {
     Data,
     Ping,
-    Headers,
     GoAway,
 }
 
@@ -17,8 +22,7 @@ impl TryFrom<u8> for FrameType {
         let frame_type = match value {
             0 => Self::Data,
             1 => Self::Ping,
-            2 => Self::Headers,
-            3 => Self::GoAway,
+            2 => Self::GoAway,
             unknown => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -36,31 +40,39 @@ impl Into<u8> for FrameType {
         match self {
             Self::Data => 0,
             Self::Ping => 1,
-            Self::Headers => 2,
-            Self::GoAway => 3,
+            Self::GoAway => 2,
         }
     }
 }
 
 // +-----------------------------------------------+
-// |                Length (24 bits)               |
+// |                 Length (24)                   |
 // +---------------+---------------+---------------+
-// |   Type (8)    |   Flags (8)   |               |
+// |   Type (8)    |   Flags (8)   |
 // +-+-------------+---------------+-------------------------------+
-// |                  ID (32)                                      |
-// +---------------------------------------------------------------+
-// |                   Payload (*)                                 |
+// |R|                 Stream Identifier (31)                      |
+// +=+=============================================================+
+// |                   Frame Payload (0...)                      ...
 // +---------------------------------------------------------------+
 #[derive(Debug)]
-pub struct Frame {
-    pub(crate) stream_id: u32,
+pub(crate) struct Frame {
     pub(crate) frame_type: FrameType,
     pub(crate) flags: u8,
+    pub(crate) stream_id: StreamId,
     pub(crate) payload: Bytes,
 }
 
 impl Frame {
     pub(crate) const HEADER_LENGTH: usize = 9;
+
+    pub(crate) fn with_data_payload(stream_id: StreamId, payload: Bytes) -> Self {
+        Self {
+            frame_type: FrameType::Data,
+            flags: 0,
+            stream_id,
+            payload,
+        }
+    }
 
     pub(crate) fn encode(&self) -> Bytes {
         let mut buf = BytesMut::with_capacity(Self::HEADER_LENGTH + self.payload.len());
@@ -101,6 +113,11 @@ impl Frame {
             flags,
             payload: payload.freeze(),
         }))
+    }
+
+    // https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.1
+    pub(crate) fn is_connection_control(&self) -> bool {
+        self.stream_id == 0
     }
 }
 
