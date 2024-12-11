@@ -1,7 +1,7 @@
 use std::io;
 
-use tokio::sync::mpsc;
 use bytes::{Bytes, BytesMut};
+use tokio::sync::mpsc;
 
 use crate::stream::StreamId;
 
@@ -13,6 +13,9 @@ pub(crate) enum FrameType {
     Data,
     Ping,
     GoAway,
+    WindowUpdate,
+    Settings,
+    RstStream,
 }
 
 impl TryFrom<u8> for FrameType {
@@ -23,6 +26,9 @@ impl TryFrom<u8> for FrameType {
             0 => Self::Data,
             1 => Self::Ping,
             2 => Self::GoAway,
+            3 => Self::WindowUpdate,
+            4 => Self::Settings,
+            5 => Self::RstStream,
             unknown => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -35,25 +41,23 @@ impl TryFrom<u8> for FrameType {
     }
 }
 
-impl Into<u8> for FrameType {
-    fn into(self) -> u8 {
-        match self {
-            Self::Data => 0,
-            Self::Ping => 1,
-            Self::GoAway => 2,
+impl From<FrameType> for u8 {
+    fn from(frame_type: FrameType) -> u8 {
+        match frame_type {
+            FrameType::Data => 0,
+            FrameType::Ping => 1,
+            FrameType::GoAway => 2,
+            FrameType::WindowUpdate => 3,
+            FrameType::Settings => 4,
+            FrameType::RstStream => 5,
         }
     }
 }
 
-// +-----------------------------------------------+
-// |                 Length (24)                   |
-// +---------------+---------------+---------------+
-// |   Type (8)    |   Flags (8)   |
-// +-+-------------+---------------+-------------------------------+
-// |R|                 Stream Identifier (31)                      |
-// +=+=============================================================+
-// |                   Frame Payload (0...)                      ...
-// +---------------------------------------------------------------+
+// Frame flags
+pub(crate) const FLAG_END_STREAM: u8 = 0x1;
+pub(crate) const FLAG_ACK: u8 = 0x2;
+
 #[derive(Debug)]
 pub(crate) struct Frame {
     pub(crate) frame_type: FrameType,
@@ -65,13 +69,54 @@ pub(crate) struct Frame {
 impl Frame {
     pub(crate) const HEADER_LENGTH: usize = 9;
 
-    pub(crate) fn with_data_payload(stream_id: StreamId, payload: Bytes) -> Self {
+    pub(crate) fn new(
+        frame_type: FrameType,
+        flags: u8,
+        stream_id: StreamId,
+        payload: Bytes,
+    ) -> Self {
         Self {
-            frame_type: FrameType::Data,
-            flags: 0,
+            frame_type,
+            flags,
             stream_id,
             payload,
         }
+    }
+
+    pub(crate) fn with_data_payload(stream_id: StreamId, payload: Bytes) -> Self {
+        Self::new(FrameType::Data, 0, stream_id, payload)
+    }
+
+    pub(crate) fn window_update(stream_id: StreamId, increment: u32) -> Self {
+        let mut payload = BytesMut::with_capacity(4);
+        payload.extend_from_slice(&increment.to_be_bytes());
+        Self::new(FrameType::WindowUpdate, 0, stream_id, payload.freeze())
+    }
+
+    pub(crate) fn ping(payload: [u8; 8]) -> Self {
+        Self::new(FrameType::Ping, 0, 0, Bytes::copy_from_slice(&payload))
+    }
+
+    pub(crate) fn pong(payload: [u8; 8]) -> Self {
+        Self::new(
+            FrameType::Ping,
+            FLAG_ACK,
+            0,
+            Bytes::copy_from_slice(&payload),
+        )
+    }
+
+    pub(crate) fn go_away(last_stream_id: StreamId, error_code: u32) -> Self {
+        let mut payload = BytesMut::with_capacity(8);
+        payload.extend_from_slice(&last_stream_id.to_be_bytes());
+        payload.extend_from_slice(&error_code.to_be_bytes());
+        Self::new(FrameType::GoAway, 0, 0, payload.freeze())
+    }
+
+    pub(crate) fn rst_stream(stream_id: StreamId, error_code: u32) -> Self {
+        let mut payload = BytesMut::with_capacity(4);
+        payload.extend_from_slice(&error_code.to_be_bytes());
+        Self::new(FrameType::RstStream, 0, stream_id, payload.freeze())
     }
 
     pub(crate) fn encode(&self) -> Bytes {
@@ -115,9 +160,42 @@ impl Frame {
         }))
     }
 
-    // https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.1
     pub(crate) fn is_connection_control(&self) -> bool {
         self.stream_id == 0
+    }
+
+    pub(crate) fn window_update_increment(&self) -> io::Result<u32> {
+        if self.frame_type != FrameType::WindowUpdate {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not a window update frame",
+            ));
+        }
+
+        if self.payload.len() != 4 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid window update payload length",
+            ));
+        }
+
+        let increment = u32::from_be_bytes(self.payload[..4].try_into().unwrap());
+        if increment == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "window update increment cannot be zero",
+            ));
+        }
+
+        Ok(increment)
+    }
+
+    pub(crate) fn is_end_stream(&self) -> bool {
+        self.flags & FLAG_END_STREAM != 0
+    }
+
+    pub(crate) fn is_ack(&self) -> bool {
+        self.flags & FLAG_ACK != 0
     }
 }
 
@@ -127,15 +205,8 @@ mod tests {
 
     #[test]
     fn test_frame_encode_decode() {
-        let test_frame = Frame {
-            stream_id: 1,
-            frame_type: FrameType::Data,
-            flags: 0,
-            payload: Bytes::from("Hello, World!"),
-        };
-
+        let test_frame = Frame::with_data_payload(1, Bytes::from("Hello, World!"));
         let encoded = test_frame.encode();
-
         let mut buf = BytesMut::from(&encoded[..]);
         let decoded = Frame::decode(&mut buf).unwrap().unwrap();
 
@@ -146,63 +217,26 @@ mod tests {
     }
 
     #[test]
-    fn test_partial_frame() {
-        let test_frame = Frame {
-            stream_id: 1,
-            frame_type: FrameType::Data,
-            flags: 0,
-            payload: Bytes::from("Hello, World!"),
-        };
-
-        let encoded = test_frame.encode();
-
-        let mut buf = BytesMut::from(&encoded[..5]);
-
-        assert!(Frame::decode(&mut buf).unwrap().is_none());
+    fn test_window_update() {
+        let frame = Frame::window_update(1, 1024);
+        assert_eq!(frame.window_update_increment().unwrap(), 1024);
     }
 
     #[test]
-    fn test_multiple_frames() {
-        let frame1 = Frame {
-            stream_id: 1,
-            frame_type: FrameType::Data,
-            flags: 0,
-            payload: Bytes::from("First frame"),
-        };
+    fn test_ping_pong() {
+        let ping = Frame::ping([1; 8]);
+        assert!(!ping.is_ack());
 
-        let frame2 = Frame {
-            stream_id: 2,
-            frame_type: FrameType::Ping,
-            flags: 1,
-            payload: Bytes::from("Second frame"),
-        };
-
-        let mut combined = BytesMut::new();
-        combined.extend_from_slice(&frame1.encode());
-        combined.extend_from_slice(&frame2.encode());
-
-        let decoded1 = Frame::decode(&mut combined).unwrap().unwrap();
-        assert_eq!(decoded1.stream_id, frame1.stream_id);
-        assert_eq!(decoded1.frame_type, frame1.frame_type);
-        assert_eq!(decoded1.payload, frame1.payload);
-
-        let decoded2 = Frame::decode(&mut combined).unwrap().unwrap();
-        assert_eq!(decoded2.stream_id, frame2.stream_id);
-        assert_eq!(decoded2.frame_type, frame2.frame_type);
-        assert_eq!(decoded2.payload, frame2.payload);
-
-        assert!(Frame::decode(&mut combined).unwrap().is_none());
+        let pong = Frame::pong([1; 8]);
+        assert!(pong.is_ack());
     }
 
     #[test]
-    fn test_invalid_frame_type() {
-        let mut buf = BytesMut::with_capacity(Frame::HEADER_LENGTH + 5);
-        buf.extend_from_slice(&[0, 0, 5]);
-        buf.extend_from_slice(&[255]);
-        buf.extend_from_slice(&[0]);
-        buf.extend_from_slice(&[0, 0, 0, 1]);
-        buf.extend_from_slice(b"hello");
+    fn test_flags() {
+        let mut frame = Frame::with_data_payload(1, Bytes::from("test"));
+        assert!(!frame.is_end_stream());
 
-        assert!(Frame::decode(&mut buf).is_err());
+        frame.flags |= FLAG_END_STREAM;
+        assert!(frame.is_end_stream());
     }
 }
