@@ -28,7 +28,7 @@ enum StreamState {
 
 pub struct StreamControl {
     state: Mutex<StreamState>,
-    window: WindowControl,
+    // window: WindowControl,
     pub outbound: mpsc::Sender<Bytes>, // 发送数据到对端
     receiver: FrameSender,             // 发送数据到本地Stream
 }
@@ -37,7 +37,7 @@ impl StreamControl {
     fn new(outbound: mpsc::Sender<Bytes>, receiver: FrameSender) -> Self {
         Self {
             state: Mutex::new(StreamState::Open),
-            window: WindowControl::new(),
+            // window: WindowControl::new(),
             outbound,
             receiver,
         }
@@ -167,9 +167,9 @@ mod impl_tokio_io_async {
             }
 
             // 检查发送窗口
-            if let Err(e) = stream.control.window.consume_send_window(buf.len()) {
-                return Poll::Ready(Err(e));
-            }
+            // if let Err(e) = stream.control.window.consume_send_window(buf.len()) {
+            //     return Poll::Ready(Err(e));
+            // }
 
             let frame = Frame::with_data_payload(stream.id, Bytes::copy_from_slice(buf));
 
@@ -177,12 +177,12 @@ mod impl_tokio_io_async {
             match stream.control.outbound.try_send(frame.encode()) {
                 Ok(()) => Poll::Ready(Ok(buf.len())),
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    // 恢复窗口大小
-                    stream
-                        .control
-                        .window
-                        .send_window
-                        .fetch_add(buf.len(), Ordering::Relaxed);
+                    // // 恢复窗口大小
+                    // stream
+                    //     .control
+                    //     .window
+                    //     .send_window
+                    //     .fetch_add(buf.len(), Ordering::Relaxed);
                     Poll::Pending
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Poll::Ready(Err(

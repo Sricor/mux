@@ -60,7 +60,7 @@ impl StreamPool {
                 }
 
                 // 检查并更新接收窗口
-                control.window.consume_send_window(frame.payload.len())?;
+                // control.window.consume_send_window(frame.payload.len())?;
 
                 // 检查是否是结束帧
                 let is_end_stream = frame.is_end_stream();
@@ -84,7 +84,7 @@ impl StreamPool {
 
             FrameType::WindowUpdate => {
                 let increment = frame.window_update_increment()? as usize;
-                control.window.update_send_window(increment)?;
+                // control.window.update_send_window(increment)?;
             }
 
             FrameType::RstStream => {
