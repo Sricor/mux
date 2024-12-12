@@ -46,7 +46,7 @@ impl Connection {
         let result = Connection {
             pool: pool.clone(),
             accept_streams,
-            next_stream_id: AtomicU32::new(1),  // 客户端从1开始，服务器从2开始
+            next_stream_id: AtomicU32::new(1), // 客户端从1开始，服务器从2开始
             ping_tracker: ping_tracker.clone(),
         };
 
@@ -89,7 +89,10 @@ impl Connection {
                 loop {
                     match read_frame(&mut read_half, &mut buf).await {
                         Ok(Some(frame)) => {
-                            if let Err(e) = handle_frame(&pool, &accept_streams_sender, &ping_tracker, frame).await {
+                            if let Err(e) =
+                                handle_frame(&pool, &accept_streams_sender, &ping_tracker, frame)
+                                    .await
+                            {
                                 eprintln!("Failed to handle frame: {}", e);
                                 break;
                             }
@@ -131,20 +134,22 @@ impl Connection {
         // 发送 GOAWAY 帧
         let frame = Frame::go_away(0, 0);
         if let Some(control) = self.pool.get(0) {
-            control.outbound.send(frame.encode()).await.map_err(|_| {
-                io::Error::new(io::ErrorKind::BrokenPipe, "failed to send goaway")
-            })?;
+            control
+                .outbound
+                .send(frame.encode())
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "failed to send goaway"))?;
         }
         Ok(())
     }
 
     pub async fn ping(&self) -> io::Result<Duration> {
         let (tx, rx) = oneshot::channel();
-        
+
         // 生成随机 payload
         let payload = rand::random::<[u8; 8]>();
         let ping_frame = Frame::ping(payload);
-        
+
         // 记录 ping 请求
         {
             let mut tracker = self.ping_tracker.lock().unwrap();
@@ -159,9 +164,11 @@ impl Connection {
 
         // 发送 ping 帧
         if let Some(control) = self.pool.get(0) {
-            control.outbound.send(ping_frame.encode()).await.map_err(|_| {
-                io::Error::new(io::ErrorKind::BrokenPipe, "failed to send ping")
-            })?;
+            control
+                .outbound
+                .send(ping_frame.encode())
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "failed to send ping"))?;
         } else {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -223,23 +230,22 @@ async fn handle_frame(
 
     // 处理流级别的帧
     match frame.frame_type {
-        FrameType::Data | FrameType::WindowUpdate => {
-            match pool.get(frame.stream_id) {
-                Some(_) => {
-                    pool.handle_frame(frame).await?;
-                }
-                None if frame.frame_type == FrameType::Data => {
-                    let stream = pool.create_stream(frame.stream_id)?;
-                    accept_streams_sender.send(stream).await.map_err(|_| {
-                        io::Error::new(io::ErrorKind::Other, "failed to accept stream")
-                    })?;
-                    pool.handle_frame(frame).await?;
-                }
-                None => {
-                    return Err(io::Error::new(io::ErrorKind::NotFound, "stream not found"));
-                }
+        FrameType::Data | FrameType::WindowUpdate => match pool.get(frame.stream_id) {
+            Some(_) => {
+                pool.handle_frame(frame).await?;
             }
-        }
+            None if frame.frame_type == FrameType::Data => {
+                let stream = pool.create_stream(frame.stream_id)?;
+                accept_streams_sender
+                    .send(stream)
+                    .await
+                    .map_err(|_| io::Error::new(io::ErrorKind::Other, "failed to accept stream"))?;
+                pool.handle_frame(frame).await?;
+            }
+            None => {
+                return Err(io::Error::new(io::ErrorKind::NotFound, "stream not found"));
+            }
+        },
         FrameType::RstStream => {
             if let Some(_) = pool.get(frame.stream_id) {
                 pool.handle_frame(frame).await?;

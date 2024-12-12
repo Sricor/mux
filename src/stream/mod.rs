@@ -5,7 +5,8 @@ use std::io;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
+use tokio::io::{ReadHalf, WriteHalf};
 use tokio::sync::mpsc;
 use window::WindowControl;
 
@@ -54,20 +55,35 @@ impl StreamControl {
 pub struct Stream {
     id: StreamId,
     control: Arc<StreamControl>,
-    reader: FrameReceiver,
+    reader: Arc<Mutex<BytesMut>>,
 }
 
 impl Stream {
-    fn new(id: StreamId, control: Arc<StreamControl>, reader: FrameReceiver) -> Self {
+    fn new(id: StreamId, control: Arc<StreamControl>, mut inbound: FrameReceiver) -> Self {
+        let reader = Arc::new(Mutex::new(bytes::BytesMut::new()));
+
+        let reader_task = reader.clone();
+
+        tokio::spawn(async move {
+            while let Some(data) = inbound.recv().await {
+                let mut r = reader_task.lock().unwrap();
+                r.extend_from_slice(&data.payload);
+            };
+        });
+
         Self {
             id,
             control,
-            reader,
+            reader
         }
     }
 
     pub fn id(&self) -> StreamId {
         self.id
+    }
+
+    pub fn split(self) -> (ReadHalf<Stream>, WriteHalf<Stream>) {
+        tokio::io::split(self)
     }
 
     pub async fn close(&self) -> io::Result<()> {
@@ -117,40 +133,46 @@ mod impl_tokio_io_async {
                 _ => {}
             }
 
-            match stream.reader.poll_recv(cx) {
-                Poll::Ready(Some(frame)) => {
-                    let payload = frame.payload;
-                    let payload_len = payload.len();
+            let s = stream.reader.lock().unwrap();
+            let len = buf.remaining();
 
-                    if buf.remaining() >= payload_len {
-                        buf.put_slice(&payload);
+            buf.put_slice(&s[..len]);
 
-                        // 检查是否需要更新接收窗口
-                        if let Some(increment) =
-                            stream.control.window.should_update_recv_window(payload_len)
-                        {
-                            let frame = Frame::window_update(stream.id, increment as u32);
-                            // 在后台发送窗口更新帧
-                            let sender = stream.control.outbound.clone();
-                            tokio::spawn(async move {
-                                let _ = sender.send(frame.encode()).await;
-                            });
-                        }
+            Poll::Ready(Ok(()))
+            // match stream.reader.poll_recv(cx) {
+            //     Poll::Ready(Some(frame)) => {
+            //         let payload = frame.payload;
+            //         let payload_len = payload.len();
 
-                        Poll::Ready(Ok(()))
-                    } else {
-                        Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::WouldBlock,
-                            "not enough space in buffer",
-                        )))
-                    }
-                }
-                Poll::Ready(None) => Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "stream closed by peer",
-                ))),
-                Poll::Pending => Poll::Pending,
-            }
+            //         if buf.remaining() >= payload_len {
+            //             buf.put_slice(&payload);
+
+            //             // 检查是否需要更新接收窗口
+            //             if let Some(increment) =
+            //                 stream.control.window.should_update_recv_window(payload_len)
+            //             {
+            //                 let frame = Frame::window_update(stream.id, increment as u32);
+            //                 // 在后台发送窗口更新帧
+            //                 let sender = stream.control.outbound.clone();
+            //                 tokio::spawn(async move {
+            //                     let _ = sender.send(frame.encode()).await;
+            //                 });
+            //             }
+
+            //             Poll::Ready(Ok(()))
+            //         } else {
+            //             Poll::Ready(Err(io::Error::new(
+            //                 io::ErrorKind::WouldBlock,
+            //                 "not enough space in buffer",
+            //             )))
+            //         }
+            //     }
+            //     Poll::Ready(None) => Poll::Ready(Err(io::Error::new(
+            //         io::ErrorKind::UnexpectedEof,
+            //         "stream closed by peer",
+            //     ))),
+            //     Poll::Pending => Poll::Pending,
+            // }
         }
     }
 

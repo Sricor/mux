@@ -1,12 +1,11 @@
 [package]
-name = "ombrac-mux"
+name = "echo"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 bytes = { version = "1" }
 tokio = { version = "1", features = ["rt", "net", "sync", "io-util"] }
-rand = "0.8"
 
-[dev-dependencies]
-tokio = { version = "1", features = ["full"] }
+[workspace]
+members = ["."]
