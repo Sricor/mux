@@ -110,7 +110,7 @@ mod impl_tokio_io_async {
     use std::io;
     use std::pin::Pin;
     use std::task::{Context, Poll};
-    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 
     use super::*;
 
@@ -132,12 +132,16 @@ mod impl_tokio_io_async {
                 }
                 _ => {}
             }
+            
+            let mut reader = stream.reader.lock().unwrap();
 
-            let s = stream.reader.lock().unwrap();
+            if reader.is_empty() {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
 
-            let len = buf.remaining();
-
-            buf.put_slice(&s[..len]);
+            let len_to_copy = buf.remaining().min(reader.len());
+            buf.put_slice(&reader.split_to(len_to_copy));
 
             Poll::Ready(Ok(()))
         }
