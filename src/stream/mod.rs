@@ -134,45 +134,12 @@ mod impl_tokio_io_async {
             }
 
             let s = stream.reader.lock().unwrap();
+
             let len = buf.remaining();
 
             buf.put_slice(&s[..len]);
 
             Poll::Ready(Ok(()))
-            // match stream.reader.poll_recv(cx) {
-            //     Poll::Ready(Some(frame)) => {
-            //         let payload = frame.payload;
-            //         let payload_len = payload.len();
-
-            //         if buf.remaining() >= payload_len {
-            //             buf.put_slice(&payload);
-
-            //             // 检查是否需要更新接收窗口
-            //             if let Some(increment) =
-            //                 stream.control.window.should_update_recv_window(payload_len)
-            //             {
-            //                 let frame = Frame::window_update(stream.id, increment as u32);
-            //                 // 在后台发送窗口更新帧
-            //                 let sender = stream.control.outbound.clone();
-            //                 tokio::spawn(async move {
-            //                     let _ = sender.send(frame.encode()).await;
-            //                 });
-            //             }
-
-            //             Poll::Ready(Ok(()))
-            //         } else {
-            //             Poll::Ready(Err(io::Error::new(
-            //                 io::ErrorKind::WouldBlock,
-            //                 "not enough space in buffer",
-            //             )))
-            //         }
-            //     }
-            //     Poll::Ready(None) => Poll::Ready(Err(io::Error::new(
-            //         io::ErrorKind::UnexpectedEof,
-            //         "stream closed by peer",
-            //     ))),
-            //     Poll::Pending => Poll::Pending,
-            // }
         }
     }
 
