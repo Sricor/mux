@@ -25,7 +25,7 @@ impl StreamPool {
         }
     }
 
-    pub(crate) async fn create_stream(&self, stream_id: StreamId) -> io::Result<Stream> {
+    pub(crate) fn create_stream(&self, stream_id: StreamId) -> io::Result<Stream> {
         let (stream_sender, stream_receiver) = mpsc::channel(DEFAULT_BUFFER_SIZE);
         let control = Arc::new(StreamControl::new(self.outbound.clone(), stream_sender));
 
@@ -127,7 +127,7 @@ mod tests_pool {
     async fn test_stream_create() {
         let (tx, _rx) = mpsc::channel(1);
         let pool = StreamPool::new(tx);
-        let stream = pool.create_stream(1).await.unwrap();
+        let stream = pool.create_stream(1).unwrap();
         assert!(!stream.is_closed());
     }
 
@@ -135,7 +135,7 @@ mod tests_pool {
     async fn test_stream_close() {
         let (tx, _rx) = mpsc::channel(1);
         let pool = StreamPool::new(tx);
-        let stream = pool.create_stream(1).await.unwrap();
+        let stream = pool.create_stream(1).unwrap();
         stream.close().await.unwrap();
         assert!(stream.is_closed());
     }

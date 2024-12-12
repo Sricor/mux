@@ -66,6 +66,10 @@ impl Stream {
         }
     }
 
+    pub fn id(&self) -> StreamId {
+        self.id
+    }
+
     pub async fn close(&self) -> io::Result<()> {
         let frame = Frame::new(FrameType::Data, FLAG_END_STREAM, self.id, Bytes::new());
 

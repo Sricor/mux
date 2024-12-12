@@ -15,7 +15,7 @@ use crate::stream::{Stream, StreamId, StreamReceiver, StreamSender};
 const DEFAULT_BUFFER_SIZE: usize = 8192;
 const PING_TIMEOUT: Duration = Duration::from_secs(5);
 
-// 新增：PingTracker 结构体
+// PingTracker 结构体
 #[derive(Default)]
 struct PingTracker {
     pending_ping: Option<(oneshot::Sender<Duration>, Instant)>,
@@ -36,15 +36,27 @@ impl Connection {
         let (frame_sender, mut frame_receiver) = mpsc::channel(DEFAULT_BUFFER_SIZE);
         let (accept_streams_sender, accept_streams) = mpsc::channel(DEFAULT_BUFFER_SIZE);
 
-        let pool = Arc::new(StreamPool::new(frame_sender));
+        let pool = Arc::new(StreamPool::new(frame_sender.clone()));
         let ping_tracker = Arc::new(Mutex::new(PingTracker::default()));
 
+        // 初始化 连接控制/PING流
+        pool.create_stream(0).unwrap();
+
+        // 创建结果实例
         let result = Connection {
             pool: pool.clone(),
             accept_streams,
-            next_stream_id: AtomicU32::new(1),
+            next_stream_id: AtomicU32::new(1),  // 客户端从1开始，服务器从2开始
             ping_tracker: ping_tracker.clone(),
         };
+
+        // 在这里创建控制流 (ID = 0)
+        let pool_clone = pool.clone();
+        tokio::spawn(async move {
+            if let Err(e) = pool_clone.create_stream(0) {
+                eprintln!("Failed to create control stream: {}", e);
+            }
+        });
 
         let (mut read_half, mut write_half) = tokio::io::split(transport);
 
@@ -100,7 +112,7 @@ impl Connection {
             .next_stream_id()
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "stream id exhausted"))?;
 
-        self.pool.create_stream(stream_id).await
+        self.pool.create_stream(stream_id)
     }
 
     pub(crate) fn next_stream_id(&self) -> Option<StreamId> {
@@ -118,11 +130,14 @@ impl Connection {
     pub async fn close(self) -> io::Result<()> {
         // 发送 GOAWAY 帧
         let frame = Frame::go_away(0, 0);
-        // TODO: 通过某种方式发送最后的 GOAWAY 帧
+        if let Some(control) = self.pool.get(0) {
+            control.outbound.send(frame.encode()).await.map_err(|_| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "failed to send goaway")
+            })?;
+        }
         Ok(())
     }
 
-    // 新实现：ping 方法
     pub async fn ping(&self) -> io::Result<Duration> {
         let (tx, rx) = oneshot::channel();
         
@@ -214,7 +229,7 @@ async fn handle_frame(
                     pool.handle_frame(frame).await?;
                 }
                 None if frame.frame_type == FrameType::Data => {
-                    let stream = pool.create_stream(frame.stream_id).await?;
+                    let stream = pool.create_stream(frame.stream_id)?;
                     accept_streams_sender.send(stream).await.map_err(|_| {
                         io::Error::new(io::ErrorKind::Other, "failed to accept stream")
                     })?;
@@ -306,9 +321,9 @@ mod tests {
     async fn test_ping_pong() {
         let (client, server) = duplex(1024);
         let client_conn = Connection::new(client);
-        let server_conn = Connection::new(server);
+        let _server_conn = Connection::new(server);
 
-        // 等待连接建立
+        // 等待连接建立和控制流创建
         sleep(Duration::from_millis(100)).await;
 
         // 发送 ping 并等待响应
@@ -320,6 +335,9 @@ mod tests {
     async fn test_ping_timeout() {
         let (client, _server) = duplex(1024);
         let conn = Connection::new(client);
+
+        // 等待控制流创建
+        sleep(Duration::from_millis(100)).await;
 
         // 发送 ping 到一个没有响应的连接
         let result = conn.ping().await;
